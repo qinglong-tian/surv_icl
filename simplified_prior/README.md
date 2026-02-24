@@ -6,7 +6,7 @@ It covers:
 - full data-generation pipeline
 - exact APIs to call
 - all outputs
-- every `SimplifiedPriorConfig` parameter (all 80 fields)
+- every `SimplifiedPriorConfig` parameter
 - practical recipes
 
 ## 1) What this module generates
@@ -64,11 +64,12 @@ delta = out["delta"]            # (B, T), 1 event observed, 0 censored
 The generator executes this order per dataset:
 
 1. sample MLP-SCM tabular data `(X, y)`
-2. convert to linear predictor `eta = y` (`nu` is fixed to 1)
-3. choose TTE mechanism (Cox or AFT)
-4. sample latent event times `T`
-5. sample censoring times `C`
-6. emit right-censored observation `(observed_T, delta)`
+2. convert a random subset of `X` features to categorical integer codes (optional via config)
+3. convert to linear predictor `eta = y` (`nu` is fixed to 1)
+4. choose TTE mechanism (Cox or AFT)
+5. sample latent event times `T`
+6. sample censoring times `C`
+7. emit right-censored observation `(observed_T, delta)`
 
 ### 3.1) Step 1: MLP-SCM tabular generation
 
@@ -77,18 +78,26 @@ The generator executes this order per dataset:
 - hidden nonlinear blocks
 - mode-dependent extraction (`causal`, `head`, `roots`)
 
-### 3.2) Step 2: latent signal
+### 3.2) Step 2: categorical conversion (optional)
+
+If categorical conversion is enabled:
+- sample `m ~ Binomial(F, p_categorical_feature)`, then clamp to
+  `[min_categorical_features, max_categorical_features]`
+- sample feature indices without replacement
+- quantile-bin each selected feature and replace values with integer category codes
+
+### 3.3) Step 3: latent signal
 
 `eta = y`
 
 Note: `nu` exists in config for compatibility but is forced to `1.0` in `__post_init__`.
 
-### 3.3) Step 3: TTE mechanism
+### 3.4) Step 4: TTE mechanism
 
 - Cox PH: `h(t | X) = h0(t) * exp(eta)`
 - AFT: `log(T) = eta + eps`
 
-### 3.4) Step 4: Cox baseline sampling
+### 3.5) Step 5: Cox baseline sampling
 
 Cox tier and family are sampled from configured probabilities, then inverse-transform sampling is applied.
 
@@ -99,7 +108,7 @@ Generic Cox sampling step:
 
 `eta` is clipped to `[-20, 20]` before sampling, and resulting times are sanitized to positive finite bounds.
 
-#### 3.4.1) Cox tier-to-family structure
+#### 3.5.1) Cox tier-to-family structure
 
 - if `cox_tier=\"auto\"`, tier is sampled using `cox_tier_probabilities`
 - family candidates by tier:
@@ -108,7 +117,7 @@ Generic Cox sampling step:
   - `tier3`: `weibull` (0.20), `gompertz` (0.20), `piecewise` (0.60)
   - `tier4`: `mixture` (1.00)
 
-#### 3.4.2) Cox family details
+#### 3.5.2) Cox family details
 
 - `exponential`
   - baseline hazard: `h0(t)=1`
@@ -175,7 +184,7 @@ Generic Cox sampling step:
     - for each row, choose component index from categorical `w`
     - apply that component's inverse transform
 
-### 3.5) Step 5: AFT family sampling
+### 3.6) Step 6: AFT family sampling
 
 AFT uses:
 - `log(T) = eta + eps`
@@ -183,7 +192,7 @@ AFT uses:
 
 `eta` is clipped to `[-20,20]` before noise is added, then output times are sanitized to positive finite bounds.
 
-#### 3.5.1) AFT tier-to-family structure
+#### 3.6.1) AFT tier-to-family structure
 
 - if `aft_tier=\"auto\"`, tier is sampled using `aft_tier_probabilities`
 - family candidates by tier:
@@ -192,7 +201,7 @@ AFT uses:
   - `tier3`: `skew_normal` (0.40), `student_t` (0.25), `generalized_gamma` (0.20), `gev` (0.15)
   - `tier4`: `mixture` (1.00)
 
-#### 3.5.2) AFT family details
+#### 3.6.2) AFT family details
 
 - `normal`
   - `eps ~ Normal(0, sigma)`
@@ -243,14 +252,14 @@ AFT uses:
   - component parameters sampled by the same family-specific rules
   - for each row, a component is chosen from categorical `w` and its `eps` sampler is applied
 
-#### 3.5.3) Shared parameter sampling helper
+#### 3.6.3) Shared parameter sampling helper
 
 For bounded parameters (`sigma`, `df`, `k`, `p`, shifts/rates, etc.), code uses beta-range sampling:
 - sample `u ~ Beta(a,a)`
 - map to interval `[L, U]` via `L + (U-L)*u`
 - concentration `a` controls centrality vs edge mass (higher `a` -> more centered).
 
-### 3.6) Step 6: right censoring sampling
+### 3.7) Step 7: right censoring sampling
 
 Two censoring modes:
 
@@ -272,14 +281,16 @@ Guardrails optionally clamp censoring times using robust `T` quantiles:
 
 ## 4) Output dictionary reference
 
-`generate_simplified_prior_data` returns a dictionary with 50 keys.
-
 ### 4.1) Core tensors
 
 | Key | Shape | Meaning |
 |---|---:|---|
 | `X` | `(B, T, F)` | features |
 | `y` | `(B, T)` | continuous scalar target |
+| `categorical_feature_mask` | `(B, F)` bool | feature-level categorical indicator |
+| `categorical_cardinalities` | `(B, F)` | number of levels per feature (`0` if continuous) |
+| `categorical_num_features` | `(B,)` | number of categorical features selected in dataset |
+| `categorical_feature_indices` | `(B, max_categorical_features)` | categorical feature indices, `-1` padded |
 | `eta` | `(B, T)` | linear predictor, equal to `y` |
 | `T` | `(B, T)` | latent event times |
 | `log_T` | `(B, T)` | latent log event times |
@@ -346,7 +357,7 @@ Guardrails optionally clamp censoring times using robust `T` quantiles:
 
 ## 5) Full parameter reference (`SimplifiedPriorConfig`)
 
-All 80 fields are listed below.
+All fields are listed below.
 
 ### 5.1) Dataset and split
 
@@ -385,7 +396,25 @@ All 80 fields are listed below.
 | `init_std` | `float` | `0.8` | must be `> 0` |
 | `sampling` | `str` | `"normal"` | `normal | uniform` root-cause sampling |
 
-### 5.5) Latent target and signal
+### 5.5) Categorical feature conversion
+
+| Parameter | Type | Default | Allowed / Notes |
+|---|---|---:|---|
+| `categorical_feature_strategy` | `str` | `"quantile"` | currently `quantile` only |
+| `p_categorical_feature` | `float` | `0.2` | probability each feature is converted (before min/max clamp), must be in `[0,1]` |
+| `min_categorical_features` | `int` | `0` | lower bound on number of converted features |
+| `max_categorical_features` | `Optional[int]` | `None` | if `None`, resolved to `F=num_features`; must be in `[0, F]` |
+| `cat_cardinality_min` | `Optional[int]` | `2` | alias for `categorical_cardinality_min` |
+| `categorical_cardinality_min` | `int` | `2` | min requested bins for selected feature |
+| `categorical_cardinality_max` | `int` | `8` | max requested bins, must be `>= min` |
+| `categorical_shuffle_labels` | `bool` | `True` | random relabeling of category ids per selected feature |
+
+Quantile binning note:
+- for each selected feature, requested bin count is sampled in
+  `[categorical_cardinality_min, categorical_cardinality_max]`
+- if quantile edges collapse due repeated values, effective cardinality is reduced automatically
+
+### 5.6) Latent target and signal
 
 | Parameter | Type | Default | Allowed / Notes |
 |---|---|---:|---|
@@ -393,14 +422,14 @@ All 80 fields are listed below.
 | `y_clip_value` | `float` | `20.0` | must be `> 0` |
 | `nu` | `float` | `1.0` | fixed to `1.0` internally (`eta = y`) |
 
-### 5.6) TTE mechanism selection
+### 5.7) TTE mechanism selection
 
 | Parameter | Type | Default | Allowed / Notes |
 |---|---|---:|---|
 | `tte_model` | `str` | `"auto"` | `auto | cox | aft` |
 | `p_cox` | `float` | `0.5` | used only in `auto`, must be in `[0,1]` |
 
-### 5.7) Censoring controls
+### 5.8) Censoring controls
 
 | Parameter | Type | Default | Allowed / Notes |
 |---|---|---:|---|
@@ -423,7 +452,7 @@ All 80 fields are listed below.
 | `censoring_time_min` | `float` | `1e-8` | absolute floor, must be `> 0` |
 | `censoring_time_max` | `float` | `1e8` | absolute cap, must be `>= min` |
 
-### 5.8) Cox controls
+### 5.9) Cox controls
 
 | Parameter | Type | Default | Allowed / Notes |
 |---|---|---:|---|
@@ -448,7 +477,7 @@ All 80 fields are listed below.
 | `cox_mixture_dirichlet_alpha` | `float` | `2.0` | Dirichlet alpha, must be `> 0` |
 | `cox_mixture_component_families` | `Sequence[str]` | `(exponential, weibull, gompertz)` | non-empty subset of allowed Cox component families |
 
-### 5.9) AFT controls
+### 5.10) AFT controls
 
 | Parameter | Type | Default | Allowed / Notes |
 |---|---|---:|---|
@@ -470,7 +499,7 @@ All 80 fields are listed below.
 | `aft_mixture_dirichlet_alpha` | `float` | `2.0` | Dirichlet alpha, must be `> 0` |
 | `aft_mixture_component_families` | `Sequence[str]` | `(normal, logistic, gumbel, student_t, skew_normal)` | non-empty subset of allowed AFT component families |
 
-### 5.10) Runtime and preset
+### 5.11) Runtime and preset
 
 | Parameter | Type | Default | Allowed / Notes |
 |---|---|---:|---|
@@ -491,6 +520,7 @@ These are useful for unit tests and controlled generation.
 - `available_aft_families()`
 - `available_censoring_modes()`
 - `available_log_location_censoring_families()`
+- `available_categorical_feature_strategies()`
 
 ### 6.2) ID mapping helpers
 
@@ -665,3 +695,64 @@ This README mirrors the current code in:
 - `simplified_prior/__init__.py`
 
 If code changes, update this manual accordingly.
+
+## 11) Smooth curriculum scheme (K stages, current stage s)
+
+The curriculum module provides a smooth scheme where stage-to-stage expected
+changes shrink when `K` is large.
+
+Core progress variable:
+- `p(s;K) = (s-1)/(K-1)` for `s in {1, ..., K}`
+
+Generation-mode schedule:
+- categorical probabilities are annealed continuously by `AnnealedCategoricalSchedule`
+- default smooth wrapper uses `GenerationModeSchedule`
+
+Integer factors (`num_layers`, `hidden_dim`) use continuous expectation plus
+stochastic rounding:
+- expected value:
+  - `x(p) = lo + (hi-lo) * p^gamma`
+- sample:
+  - `floor(x)` or `ceil(x)` with probabilities chosen so `E[sample]=x`
+
+This gives continuity in expectation and small adjacent-stage drift when `K`
+is large.
+
+Relevant APIs:
+- `smooth_stage_value(stage_idx, total_stages, lo, hi, gamma=1.0)`
+- `sample_smooth_curriculum_config(...)`
+- `sample_smooth_curriculum_config_with_context(...)`
+- `generate_smooth_curriculum_stage_batch(...)`
+- `SmoothIntegerSchedule`
+
+Example:
+
+```python
+from simplified_prior import (
+    SimplifiedPriorConfig,
+    CurriculumBounds,
+    generate_smooth_curriculum_stage_batch,
+)
+
+base_cfg = SimplifiedPriorConfig(num_features=20, num_causes=20, seq_len=512)
+bounds = CurriculumBounds(
+    num_layers_min=2,
+    num_layers_max=6,
+    hidden_dim_min=16,
+    hidden_dim_max=64,
+)
+
+K = 20
+s = 7
+stage_cfg, batch, ctx = generate_smooth_curriculum_stage_batch(
+    base_cfg=base_cfg,
+    stage_idx=s,
+    total_stages=K,
+    bounds=bounds,
+    num_datasets=8,
+    return_context=True,
+    # optional curvature controls
+    num_layers_gamma=1.0,
+    hidden_dim_gamma=1.0,
+)
+```

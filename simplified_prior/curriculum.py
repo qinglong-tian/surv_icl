@@ -105,6 +105,46 @@ class GenerationModeSchedule:
         )
 
 
+@dataclass(frozen=True)
+class SmoothIntegerSchedule:
+    """Continuous schedule for integer-valued factors.
+
+    For progress p in [0, 1], define:
+    - p_tilde = p^gamma
+    - x(p) = lo + (hi - lo) * p_tilde
+
+    Sampling uses stochastic rounding around x(p), so expected value changes
+    continuously as stage advances, and per-stage changes shrink as K grows.
+    """
+
+    lo: int
+    hi: int
+    gamma: float = 1.0
+
+    def __post_init__(self) -> None:
+        if int(self.lo) > int(self.hi):
+            raise ValueError("lo must be <= hi.")
+        if float(self.gamma) <= 0.0:
+            raise ValueError("gamma must be > 0.")
+
+    def expected_value(self, progress: float) -> float:
+        p = float(np.clip(progress, 0.0, 1.0))
+        t = float(p**float(self.gamma))
+        return float(int(self.lo) + (int(self.hi) - int(self.lo)) * t)
+
+    def sample(self, progress: float, rng: np.random.Generator) -> int:
+        x = self.expected_value(progress=progress)
+        lo_i = int(np.floor(x))
+        hi_i = int(np.ceil(x))
+        lo_i = int(np.clip(lo_i, int(self.lo), int(self.hi)))
+        hi_i = int(np.clip(hi_i, int(self.lo), int(self.hi)))
+        if hi_i <= lo_i:
+            return lo_i
+        p_hi = float(np.clip(x - lo_i, 0.0, 1.0))
+        draw = float(rng.random())
+        return hi_i if draw < p_hi else lo_i
+
+
 STAGE_DEPENDENT_FACTORS = {"generation_mode", "num_layers", "hidden_dim"}
 
 # These are derived from generation_mode in SimplifiedPriorConfig.
@@ -313,6 +353,23 @@ def stage_linear_probability(stage_idx: int, total_stages: int, start: float, en
     return float((1.0 - p) * start + p * end)
 
 
+def smooth_stage_value(
+    stage_idx: int,
+    total_stages: int,
+    lo: int,
+    hi: int,
+    gamma: float = 1.0,
+) -> float:
+    """Continuous stage value x(s; K) for smooth curriculum schedules.
+
+    With progress p = (s-1)/(K-1), this returns:
+    x = lo + (hi - lo) * p^gamma
+    """
+    p = stage_progress(stage_idx=stage_idx, total_stages=total_stages)
+    schedule = SmoothIntegerSchedule(lo=int(lo), hi=int(hi), gamma=float(gamma))
+    return schedule.expected_value(progress=p)
+
+
 def sample_curriculum_factor_context(
     stage_idx: int,
     total_stages: int,
@@ -325,6 +382,8 @@ def sample_curriculum_factor_context(
     extra_stage_samplers: Optional[Mapping[str, object]] = None,
     progress: Optional[float] = None,
     current_values: Optional[Dict[str, object]] = None,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
 ) -> Dict[str, object]:
     """Sample stage-dependent factors, including optional future factors.
 
@@ -332,16 +391,15 @@ def sample_curriculum_factor_context(
     `extra_stage_samplers` provides them.
     """
     p = _resolve_progress(stage_idx=stage_idx, total_stages=total_stages, progress=progress)
-
-    layer_upper = _linear_int_upper_from_progress(
-        progress=p,
+    layer_schedule = SmoothIntegerSchedule(
         lo=int(bounds.num_layers_min),
         hi=int(bounds.num_layers_max),
+        gamma=float(num_layers_gamma),
     )
-    hidden_upper = _linear_int_upper_from_progress(
-        progress=p,
+    hidden_schedule = SmoothIntegerSchedule(
         lo=int(bounds.hidden_dim_min),
         hi=int(bounds.hidden_dim_max),
+        gamma=float(hidden_dim_gamma),
     )
 
     factor_values: Dict[str, object] = {
@@ -355,8 +413,8 @@ def sample_curriculum_factor_context(
             progress=p,
             rng=rng,
         ),
-        "num_layers": int(rng.integers(int(bounds.num_layers_min), int(layer_upper) + 1)),
-        "hidden_dim": int(rng.integers(int(bounds.hidden_dim_min), int(hidden_upper) + 1)),
+        "num_layers": int(layer_schedule.sample(progress=p, rng=rng)),
+        "hidden_dim": int(hidden_schedule.sample(progress=p, rng=rng)),
     }
 
     merged_values = dict(current_values or {})
@@ -389,6 +447,8 @@ def sample_stage_dependent_hyperparameters(
     mode_schedule: Optional[GenerationModeSchedule] = None,
     extra_stage_samplers: Optional[Mapping[str, object]] = None,
     progress: Optional[float] = None,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
 ) -> Dict[str, object]:
     """Sample stage-dependent config fields."""
     factors = sample_curriculum_factor_context(
@@ -402,6 +462,8 @@ def sample_stage_dependent_hyperparameters(
         mode_schedule=mode_schedule,
         extra_stage_samplers=extra_stage_samplers,
         progress=progress,
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
     )
     return {k: v for k, v in factors.items() if k in STAGE_DEPENDENT_FACTORS}
 
@@ -433,6 +495,8 @@ def sample_curriculum_config_with_context(
     mode_schedule: Optional[GenerationModeSchedule] = None,
     extra_stage_samplers: Optional[Mapping[str, object]] = None,
     progress: Optional[float] = None,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
 ) -> Tuple[SimplifiedPriorConfig, Dict[str, object]]:
     """Sample one curriculum config and return full stage factor context."""
     if rng is None:
@@ -455,6 +519,8 @@ def sample_curriculum_config_with_context(
         extra_stage_samplers=extra_stage_samplers,
         progress=progress,
         current_values=dict(cfg_dict),
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
     )
     cfg_overrides, extra_factors = _split_cfg_and_extra_factors(cfg_dict=cfg_dict, factor_context=factor_context)
 
@@ -481,6 +547,8 @@ def sample_curriculum_config(
     mode_schedule: Optional[GenerationModeSchedule] = None,
     extra_stage_samplers: Optional[Mapping[str, object]] = None,
     progress: Optional[float] = None,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
 ) -> SimplifiedPriorConfig:
     """Backward-compatible config sampler (without extra-factor return)."""
     stage_cfg, _ = sample_curriculum_config_with_context(
@@ -494,6 +562,81 @@ def sample_curriculum_config(
         mode_schedule=mode_schedule,
         extra_stage_samplers=extra_stage_samplers,
         progress=progress,
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
+    )
+    return stage_cfg
+
+
+def sample_smooth_curriculum_config_with_context(
+    base_cfg: SimplifiedPriorConfig,
+    stage_idx: int,
+    total_stages: int,
+    bounds: CurriculumBounds,
+    p_roots_given_noncausal: float = 0.5,
+    stationary_sampler: Optional[Dict[str, object]] = None,
+    rng: Optional[np.random.Generator] = None,
+    mode_schedule: Optional[GenerationModeSchedule] = None,
+    extra_stage_samplers: Optional[Mapping[str, object]] = None,
+    progress: Optional[float] = None,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
+) -> Tuple[SimplifiedPriorConfig, Dict[str, object]]:
+    """Smooth curriculum wrapper using continuous stage progression.
+
+    Let K be total stages and s be current stage:
+    - p(s;K) = (s-1)/(K-1)
+    - generation_mode probabilities are annealed via GenerationModeSchedule
+    - integer factors use smooth expectation + stochastic rounding:
+      x = lo + (hi-lo) * p^gamma
+
+    This yields small expected changes between stages when K is large.
+    """
+    schedule = mode_schedule or GenerationModeSchedule()
+    return sample_curriculum_config_with_context(
+        base_cfg=base_cfg,
+        stage_idx=stage_idx,
+        total_stages=total_stages,
+        bounds=bounds,
+        p_roots_given_noncausal=float(p_roots_given_noncausal),
+        stationary_sampler=stationary_sampler,
+        rng=rng,
+        mode_schedule=schedule,
+        extra_stage_samplers=extra_stage_samplers,
+        progress=progress,
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
+    )
+
+
+def sample_smooth_curriculum_config(
+    base_cfg: SimplifiedPriorConfig,
+    stage_idx: int,
+    total_stages: int,
+    bounds: CurriculumBounds,
+    p_roots_given_noncausal: float = 0.5,
+    stationary_sampler: Optional[Dict[str, object]] = None,
+    rng: Optional[np.random.Generator] = None,
+    mode_schedule: Optional[GenerationModeSchedule] = None,
+    extra_stage_samplers: Optional[Mapping[str, object]] = None,
+    progress: Optional[float] = None,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
+) -> SimplifiedPriorConfig:
+    """Smooth curriculum config sampler."""
+    stage_cfg, _ = sample_smooth_curriculum_config_with_context(
+        base_cfg=base_cfg,
+        stage_idx=stage_idx,
+        total_stages=total_stages,
+        bounds=bounds,
+        p_roots_given_noncausal=float(p_roots_given_noncausal),
+        stationary_sampler=stationary_sampler,
+        rng=rng,
+        mode_schedule=mode_schedule,
+        extra_stage_samplers=extra_stage_samplers,
+        progress=progress,
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
     )
     return stage_cfg
 
@@ -511,6 +654,8 @@ def generate_curriculum_stage_batch(
     extra_stage_samplers: Optional[Mapping[str, object]] = None,
     progress: Optional[float] = None,
     return_context: bool = False,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
 ) -> Tuple[SimplifiedPriorConfig, Dict[str, object]] | Tuple[
     SimplifiedPriorConfig,
     Dict[str, object],
@@ -528,6 +673,49 @@ def generate_curriculum_stage_batch(
         mode_schedule=mode_schedule,
         extra_stage_samplers=extra_stage_samplers,
         progress=progress,
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
+    )
+    batch = generate_simplified_prior_data(stage_cfg, num_datasets=num_datasets)
+    if return_context:
+        return stage_cfg, batch, factor_context
+    return stage_cfg, batch
+
+
+def generate_smooth_curriculum_stage_batch(
+    base_cfg: SimplifiedPriorConfig,
+    stage_idx: int,
+    total_stages: int,
+    bounds: CurriculumBounds,
+    num_datasets: int,
+    p_roots_given_noncausal: float = 0.5,
+    stationary_sampler: Optional[Dict[str, object]] = None,
+    rng: Optional[np.random.Generator] = None,
+    mode_schedule: Optional[GenerationModeSchedule] = None,
+    extra_stage_samplers: Optional[Mapping[str, object]] = None,
+    progress: Optional[float] = None,
+    return_context: bool = False,
+    num_layers_gamma: float = 1.0,
+    hidden_dim_gamma: float = 1.0,
+) -> Tuple[SimplifiedPriorConfig, Dict[str, object]] | Tuple[
+    SimplifiedPriorConfig,
+    Dict[str, object],
+    Dict[str, object],
+]:
+    """Generate a batch with the smooth curriculum sampler."""
+    stage_cfg, factor_context = sample_smooth_curriculum_config_with_context(
+        base_cfg=base_cfg,
+        stage_idx=stage_idx,
+        total_stages=total_stages,
+        bounds=bounds,
+        p_roots_given_noncausal=float(p_roots_given_noncausal),
+        stationary_sampler=stationary_sampler,
+        rng=rng,
+        mode_schedule=mode_schedule,
+        extra_stage_samplers=extra_stage_samplers,
+        progress=progress,
+        num_layers_gamma=float(num_layers_gamma),
+        hidden_dim_gamma=float(hidden_dim_gamma),
     )
     batch = generate_simplified_prior_data(stage_cfg, num_datasets=num_datasets)
     if return_context:

@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 GENERATION_MODES: Tuple[str, ...] = ("causal", "head", "roots")
 SAMPLING_MODES: Tuple[str, ...] = ("normal", "uniform")
+CATEGORICAL_FEATURE_STRATEGIES: Tuple[str, ...] = ("quantile",)
 TTE_MODELS: Tuple[str, ...] = ("cox", "aft")
 COX_BASELINE_TIERS: Tuple[str, ...] = ("tier1", "tier2", "tier3", "tier4")
 COX_BASELINE_FAMILIES: Tuple[str, ...] = ("exponential", "weibull", "gompertz", "piecewise", "mixture")
@@ -156,6 +157,17 @@ class SimplifiedPriorConfig:
     init_std: float = 0.8
     sampling: str = "normal"  # normal | uniform
 
+    # Optional categorical conversion for X.
+    # A random subset of features is converted into integer-coded categories.
+    categorical_feature_strategy: str = "quantile"  # quantile
+    p_categorical_feature: float = 0.2
+    min_categorical_features: int = 0
+    max_categorical_features: Optional[int] = None  # None => num_features (F)
+    cat_cardinality_min: Optional[int] = 2  # alias of categorical_cardinality_min
+    categorical_cardinality_min: int = 2
+    categorical_cardinality_max: int = 8
+    categorical_shuffle_labels: bool = True
+
     # Survival-signal controls.
     standardize_y: bool = True
     y_clip_value: float = 20.0
@@ -270,6 +282,7 @@ class SimplifiedPriorConfig:
     def __post_init__(self) -> None:
         self._apply_difficulty_preset()
         self._resolve_and_validate_generation_mode()
+        self._resolve_and_validate_categorical_features()
         self._resolve_and_validate_tte_model()
         self._resolve_and_validate_censoring_mode()
         self._resolve_and_validate_cox_tier()
@@ -310,6 +323,25 @@ class SimplifiedPriorConfig:
         if mode == "roots" and int(self.num_causes) != int(self.num_features):
             raise ValueError("generation_mode='roots' requires num_causes == num_features.")
 
+    def _resolve_and_validate_categorical_features(self) -> None:
+        strategy = str(self.categorical_feature_strategy).strip().lower()
+        if strategy not in CATEGORICAL_FEATURE_STRATEGIES:
+            raise ValueError(
+                "categorical_feature_strategy must be one of: "
+                f"{', '.join(repr(x) for x in CATEGORICAL_FEATURE_STRATEGIES)}."
+            )
+        self.categorical_feature_strategy = strategy
+
+        if self.max_categorical_features is None:
+            resolved_max = int(self.num_features)
+        else:
+            resolved_max = int(self.max_categorical_features)
+        self.max_categorical_features = resolved_max
+
+        if self.cat_cardinality_min is not None:
+            self.categorical_cardinality_min = int(self.cat_cardinality_min)
+        self.cat_cardinality_min = int(self.categorical_cardinality_min)
+
     def _validate_basic_constraints(self) -> None:
         if int(self.seq_len) <= 1:
             raise ValueError("seq_len must be > 1.")
@@ -321,6 +353,20 @@ class SimplifiedPriorConfig:
             raise ValueError("noise_std must be >= 0.")
         if float(self.init_std) <= 0.0:
             raise ValueError("init_std must be > 0.")
+        if int(self.min_categorical_features) < 0:
+            raise ValueError("min_categorical_features must be >= 0.")
+        if int(self.max_categorical_features) < 0:
+            raise ValueError("max_categorical_features must be >= 0.")
+        if int(self.max_categorical_features) > int(self.num_features):
+            raise ValueError("max_categorical_features must be <= num_features.")
+        if int(self.min_categorical_features) > int(self.max_categorical_features):
+            raise ValueError("min_categorical_features must be <= max_categorical_features.")
+        if not (0.0 <= float(self.p_categorical_feature) <= 1.0):
+            raise ValueError("p_categorical_feature must be in [0, 1].")
+        if int(self.categorical_cardinality_min) < 2:
+            raise ValueError("categorical_cardinality_min must be >= 2.")
+        if int(self.categorical_cardinality_max) < int(self.categorical_cardinality_min):
+            raise ValueError("categorical_cardinality_max must be >= categorical_cardinality_min.")
         if float(self.y_clip_value) <= 0.0:
             raise ValueError("y_clip_value must be > 0.")
         if not (0.0 <= float(self.p_cox) <= 1.0):
@@ -643,6 +689,101 @@ class SimpleMLPSCMPrior(nn.Module):
         return permuted[:feature_count]
 
 
+def _sample_num_categorical_features(cfg: SimplifiedPriorConfig) -> int:
+    F = int(cfg.num_features)
+    p = float(np.clip(float(cfg.p_categorical_feature), 0.0, 1.0))
+    sampled = int(np.random.binomial(n=F, p=p))
+    lo = int(cfg.min_categorical_features)
+    hi = int(cfg.max_categorical_features)
+    if hi < lo:
+        return lo
+    return int(np.clip(sampled, lo, hi))
+
+
+def _quantile_encode_column(
+    column_values: np.ndarray,
+    requested_bins: int,
+    shuffle_labels: bool,
+) -> Tuple[np.ndarray, int]:
+    """Encode a continuous column into quantile bins.
+
+    Degenerate quantile boundaries are handled by collapsing to the number of
+    distinct valid bin regions implied by unique quantiles.
+    """
+    x = np.asarray(column_values, dtype=np.float64)
+    n = int(x.shape[0])
+    if n == 0:
+        return np.zeros((0,), dtype=np.int64), 0
+
+    bins = max(int(requested_bins), 1)
+    quantile_grid = np.linspace(0.0, 1.0, bins + 1, dtype=np.float64)
+    edges = np.quantile(x, quantile_grid)
+    edges = np.unique(edges)
+
+    if edges.size <= 1:
+        return np.zeros((n,), dtype=np.int64), 1
+
+    internal_edges = edges[1:-1]
+    if internal_edges.size == 0:
+        labels = np.zeros((n,), dtype=np.int64)
+        cardinality = 1
+    else:
+        labels = np.digitize(x, bins=internal_edges, right=False).astype(np.int64)
+        cardinality = int(labels.max()) + 1
+
+    if shuffle_labels and cardinality > 1:
+        perm = np.random.permutation(cardinality)
+        labels = perm[labels]
+
+    return labels.astype(np.int64), cardinality
+
+
+def _apply_categorical_feature_conversion(
+    X: Tensor,
+    cfg: SimplifiedPriorConfig,
+) -> Tuple[Tensor, Tensor, Tensor, np.ndarray]:
+    """Convert a random subset of features into categorical integer codes.
+
+    Returns:
+    - X_converted: (T, F), float tensor with categorical columns integer-coded.
+    - categorical_mask: (F,), bool tensor.
+    - categorical_cardinalities: (F,), long tensor (0 for non-categorical).
+    - categorical_feature_indices: (m,), numpy int64 indices of selected columns.
+    """
+    F = int(cfg.num_features)
+    m = min(_sample_num_categorical_features(cfg), F)
+    if m <= 0:
+        return (
+            X,
+            torch.zeros((F,), dtype=torch.bool),
+            torch.zeros((F,), dtype=torch.long),
+            np.zeros((0,), dtype=np.int64),
+        )
+
+    selected = np.random.choice(F, size=m, replace=False).astype(np.int64)
+    selected.sort()
+
+    X_out = X.clone()
+    mask = torch.zeros((F,), dtype=torch.bool)
+    cardinalities = torch.zeros((F,), dtype=torch.long)
+    X_np = X_out.detach().cpu().numpy()
+
+    card_lo = int(cfg.categorical_cardinality_min)
+    card_hi = int(cfg.categorical_cardinality_max)
+    for j in selected:
+        requested_bins = int(np.random.randint(card_lo, card_hi + 1))
+        labels, card = _quantile_encode_column(
+            column_values=X_np[:, int(j)],
+            requested_bins=requested_bins,
+            shuffle_labels=bool(cfg.categorical_shuffle_labels),
+        )
+        X_out[:, int(j)] = torch.from_numpy(labels).to(device=X_out.device, dtype=X_out.dtype)
+        mask[int(j)] = True
+        cardinalities[int(j)] = int(card)
+
+    return X_out, mask, cardinalities, selected
+
+
 def generate_simplified_prior_data(
     cfg: SimplifiedPriorConfig,
     num_datasets: int = 1,
@@ -652,6 +793,10 @@ def generate_simplified_prior_data(
     Returned tensor shapes:
     - X: (B, T, F)
     - y: (B, T)
+    - categorical_feature_mask: (B, F), True for converted categorical features
+    - categorical_cardinalities: (B, F), number of levels per feature (0 for non-categorical)
+    - categorical_num_features: (B,), number of converted categorical features
+    - categorical_feature_indices: (B, max_categorical_features), -1 padded feature indices
     - T: (B, T), latent event times
     - log_T: (B, T), latent log event times
     - C: (B, T), censoring times
@@ -701,6 +846,9 @@ def generate_simplified_prior_data(
     train_size = cfg.resolve_train_size()
     X_list: list[Tensor] = []
     y_list: list[Tensor] = []
+    categorical_feature_mask_list: list[Tensor] = []
+    categorical_cardinalities_list: list[Tensor] = []
+    categorical_num_features: list[int] = []
     t_list: list[Tensor] = []
     log_t_list: list[Tensor] = []
     c_list: list[Tensor] = []
@@ -749,6 +897,11 @@ def generate_simplified_prior_data(
     max_piecewise_intervals = int(cfg.cox_piecewise_max_intervals)
     cox_piecewise_breakpoints = np.full((int(num_datasets), max(max_piecewise_intervals - 1, 0)), np.nan, dtype=np.float32)
     cox_piecewise_hazards = np.full((int(num_datasets), max_piecewise_intervals), np.nan, dtype=np.float32)
+    categorical_feature_indices = np.full(
+        (int(num_datasets), int(cfg.max_categorical_features)),
+        -1,
+        dtype=np.int64,
+    )
 
     for ds_idx in range(int(num_datasets)):
         sampled_tte_model = sample_tte_model(cfg=cfg)
@@ -851,8 +1004,15 @@ def generate_simplified_prior_data(
         prior = SimpleMLPSCMPrior(cfg)
         with torch.no_grad():
             X, y = prior()
-        X_list.append(X.detach())
+        X, cat_mask, cat_cardinalities, cat_indices = _apply_categorical_feature_conversion(X=X.detach(), cfg=cfg)
+        X_list.append(X)
         y_list.append(y.detach())
+        categorical_feature_mask_list.append(cat_mask)
+        categorical_cardinalities_list.append(cat_cardinalities)
+        categorical_num_features.append(int(cat_indices.shape[0]))
+        if cat_indices.size > 0:
+            take = min(cat_indices.size, categorical_feature_indices.shape[1])
+            categorical_feature_indices[ds_idx, :take] = cat_indices[:take]
 
         eta_np = y_to_linear_predictor(y.detach(), nu=float(cfg.nu)).cpu().numpy().astype(np.float64)
         if sampled_tte_model == "cox":
@@ -892,6 +1052,10 @@ def generate_simplified_prior_data(
 
     X_batch = torch.stack(X_list, dim=0).cpu()
     y_batch = torch.stack(y_list, dim=0).cpu()
+    categorical_feature_mask_batch = torch.stack(categorical_feature_mask_list, dim=0).cpu()
+    categorical_cardinalities_batch = torch.stack(categorical_cardinalities_list, dim=0).cpu()
+    categorical_num_features_batch = torch.tensor(categorical_num_features, dtype=torch.long)
+    categorical_feature_indices_batch = torch.tensor(categorical_feature_indices, dtype=torch.long)
     T_batch = torch.stack(t_list, dim=0).cpu()
     log_T_batch = torch.stack(log_t_list, dim=0).cpu()
     C_batch = torch.stack(c_list, dim=0).cpu()
@@ -944,6 +1108,10 @@ def generate_simplified_prior_data(
     return {
         "X": X_batch,
         "y": y_batch,
+        "categorical_feature_mask": categorical_feature_mask_batch,
+        "categorical_cardinalities": categorical_cardinalities_batch,
+        "categorical_num_features": categorical_num_features_batch,
+        "categorical_feature_indices": categorical_feature_indices_batch,
         "T": T_batch,
         "log_T": log_T_batch,
         "C": C_batch,
@@ -1008,6 +1176,10 @@ def split_dataset(X: Tensor, y: Tensor, train_size: int) -> Dict[str, Tensor]:
 
 def available_nonlinearities() -> Iterable[str]:
     return tuple(sorted(_ACTIVATIONS.keys()))
+
+
+def available_categorical_feature_strategies() -> Iterable[str]:
+    return CATEGORICAL_FEATURE_STRATEGIES
 
 
 def available_difficulties() -> Iterable[str]:
