@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +28,12 @@ AFT_FAMILIES: Tuple[str, ...] = (
 CENSORING_MODES: Tuple[str, ...] = ("log_location", "administrative")
 LOG_LOCATION_CENSORING_FAMILIES: Tuple[str, ...] = ("normal", "logistic", "student_t")
 ADMINISTRATIVE_JITTER_MODES: Tuple[str, ...] = ("lognormal", "uniform")
+FULL_DISTRIBUTION_GENERATION_MODE_VALUES: Tuple[str, ...] = ("head", "causal", "roots")
+FULL_DISTRIBUTION_GENERATION_MODE_PROBS: Tuple[float, float, float] = (0.45, 0.35, 0.20)
+FULL_DISTRIBUTION_NUM_LAYERS_VALUES: Tuple[int, ...] = (3, 4, 5)
+FULL_DISTRIBUTION_NUM_LAYERS_PROBS: Tuple[float, float, float] = (0.40, 0.40, 0.20)
+FULL_DISTRIBUTION_HIDDEN_DIM_VALUES: Tuple[int, ...] = (24, 32, 48)
+FULL_DISTRIBUTION_HIDDEN_DIM_PROBS: Tuple[float, float, float] = (0.35, 0.45, 0.20)
 
 
 class SignActivation(nn.Module):
@@ -1018,6 +1024,158 @@ def available_censoring_modes() -> Iterable[str]:
 
 def available_log_location_censoring_families() -> Iterable[str]:
     return LOG_LOCATION_CENSORING_FAMILIES
+
+
+def full_distribution_base_overrides() -> Dict[str, object]:
+    """Recommended bounded stage-invariant settings for pretraining.
+
+    This profile is intended as a practical \"full\" distribution:
+    broad enough to cover diverse regimes, but conservative enough to avoid
+    frequent extreme event/censoring values.
+
+    Stage-dependent factors are intentionally excluded:
+    - generation_mode
+    - num_layers
+    - hidden_dim
+    """
+    return {
+        "seq_len": 512,
+        "train_size": 0.5,
+        "num_features": 20,
+        "num_causes": 20,
+        "y_is_effect": True,
+        "in_clique": False,
+        "sort_features": True,
+        "nonlinearities": (
+            "tanh",
+            "relu",
+            "gelu",
+            "identity",
+            "sign",
+            "heaviside",
+            "rbf",
+            "sine",
+            "square",
+            "abs",
+        ),
+        "per_layer_activation": False,
+        "noise_std": 0.01,
+        "init_std": 0.8,
+        "sampling": "normal",
+        "standardize_y": True,
+        "y_clip_value": 8.0,
+        "tte_model": "auto",
+        "p_cox": 0.5,
+        "censoring_mode": "auto",
+        "p_administrative_censoring": 0.7,
+        "censoring_shape_concentration": 2.5,
+        "censoring_log_location_family": "auto",
+        "censoring_log_location_shift_min": -0.5,
+        "censoring_log_location_shift_max": 0.5,
+        "censoring_log_location_student_df_min": 6.0,
+        "censoring_log_location_student_df_max": 16.0,
+        "censoring_admin_target_rate_min": 0.15,
+        "censoring_admin_target_rate_max": 0.45,
+        "censoring_admin_jitter_mode": "lognormal",
+        "censoring_admin_lognormal_sigma": 0.10,
+        "censoring_admin_uniform_radius": 1.15,
+        "censoring_apply_guardrails": True,
+        "censoring_clamp_min_multiplier": 0.7,
+        "censoring_clamp_max_multiplier": 1.6,
+        "censoring_time_min": 1e-6,
+        "censoring_time_max": 1e6,
+        "cox_tier": "auto",
+        "cox_tier_probabilities": (0.45, 0.30, 0.20, 0.05),
+        "cox_weibull_theta_max": 0.6,
+        "cox_weibull_shape_concentration": 2.5,
+        "cox_gompertz_hr_max": 2.0,
+        "cox_gompertz_reference_time": 5.0,
+        "cox_gompertz_shape_concentration": 2.5,
+        "cox_piecewise_min_intervals": 3,
+        "cox_piecewise_max_intervals": 6,
+        "cox_piecewise_t_max": 4.0,
+        "cox_piecewise_breakpoint_alpha": 2.5,
+        "cox_piecewise_min_width_fraction": 0.05,
+        "cox_piecewise_b1_max": 0.7,
+        "cox_piecewise_b2_max": 0.5,
+        "cox_piecewise_b3_max": 0.3,
+        "cox_piecewise_shape_concentration": 2.5,
+        "cox_mixture_min_components": 2,
+        "cox_mixture_max_components": 3,
+        "cox_mixture_dirichlet_alpha": 2.5,
+        "cox_mixture_component_families": ("exponential", "weibull", "gompertz"),
+        "aft_tier": "auto",
+        "aft_tier_probabilities": (0.45, 0.30, 0.20, 0.05),
+        "aft_shape_concentration": 2.5,
+        "aft_sigma_min": 0.7,
+        "aft_sigma_max": 1.4,
+        "aft_student_df_min": 5.0,
+        "aft_student_df_max": 18.0,
+        "aft_gg_k_min": 0.8,
+        "aft_gg_k_max": 1.5,
+        "aft_gg_p_min": 0.8,
+        "aft_gg_p_max": 1.5,
+        "aft_gev_xi_max": 0.2,
+        "aft_skew_alpha_max": 4.0,
+        "aft_mixture_min_components": 2,
+        "aft_mixture_max_components": 3,
+        "aft_mixture_dirichlet_alpha": 2.5,
+        "aft_mixture_component_families": ("normal", "logistic", "gumbel", "student_t", "skew_normal"),
+        "seed": None,
+        "device": "cpu",
+        "difficulty": None,
+    }
+
+
+def sample_full_distribution_config(
+    overrides: Optional[Mapping[str, object]] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> SimplifiedPriorConfig:
+    """Sample one config from the recommended bounded full distribution.
+
+    Sampled factors:
+    - generation_mode from FULL_DISTRIBUTION_GENERATION_MODE_VALUES/PROBS
+      (roots removed automatically when num_causes != num_features)
+    - num_layers from FULL_DISTRIBUTION_NUM_LAYERS_VALUES/PROBS
+    - hidden_dim from FULL_DISTRIBUTION_HIDDEN_DIM_VALUES/PROBS
+
+    All remaining factors come from `full_distribution_base_overrides()`
+    unless overridden by `overrides`.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    cfg_kwargs = full_distribution_base_overrides()
+    if overrides is not None:
+        cfg_kwargs.update(dict(overrides))
+
+    if "generation_mode" not in cfg_kwargs:
+        mode_values = list(FULL_DISTRIBUTION_GENERATION_MODE_VALUES)
+        mode_probs = np.asarray(FULL_DISTRIBUTION_GENERATION_MODE_PROBS, dtype=np.float64)
+        if int(cfg_kwargs["num_causes"]) != int(cfg_kwargs["num_features"]):
+            keep_idx = [i for i, name in enumerate(mode_values) if name != "roots"]
+            mode_values = [mode_values[i] for i in keep_idx]
+            mode_probs = mode_probs[keep_idx]
+        mode_probs = mode_probs / max(float(mode_probs.sum()), 1e-12)
+        cfg_kwargs["generation_mode"] = str(rng.choice(mode_values, p=mode_probs))
+
+    if "num_layers" not in cfg_kwargs:
+        layer_values = np.asarray(FULL_DISTRIBUTION_NUM_LAYERS_VALUES, dtype=np.int64)
+        layer_probs = np.asarray(FULL_DISTRIBUTION_NUM_LAYERS_PROBS, dtype=np.float64)
+        layer_probs = layer_probs / max(float(layer_probs.sum()), 1e-12)
+        cfg_kwargs["num_layers"] = int(rng.choice(layer_values, p=layer_probs))
+
+    if "hidden_dim" not in cfg_kwargs:
+        hidden_values = np.asarray(FULL_DISTRIBUTION_HIDDEN_DIM_VALUES, dtype=np.int64)
+        hidden_probs = np.asarray(FULL_DISTRIBUTION_HIDDEN_DIM_PROBS, dtype=np.float64)
+        hidden_probs = hidden_probs / max(float(hidden_probs.sum()), 1e-12)
+        cfg_kwargs["hidden_dim"] = int(rng.choice(hidden_values, p=hidden_probs))
+
+    # The \"auto\"/legacy flags are not needed when generation_mode is explicit.
+    cfg_kwargs.setdefault("is_causal", False)
+    cfg_kwargs.setdefault("noncausal_feature_source", "head")
+    cfg_kwargs["difficulty"] = None
+    return SimplifiedPriorConfig(**cfg_kwargs)
 
 
 def available_cox_baseline_tiers() -> Iterable[str]:

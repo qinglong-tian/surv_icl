@@ -571,6 +571,72 @@ out = generate_simplified_prior_data(cfg, num_datasets=1)
 
 Realized censoring in a finite sample can differ slightly from target.
 
+### 7.5) Recommended bounded full distribution for pretraining
+
+Use:
+- `full_distribution_base_overrides()`: deterministic bounded defaults
+- `sample_full_distribution_config(...)`: samples stage-dependent factors and returns a full config
+
+```python
+from simplified_prior import sample_full_distribution_config, generate_simplified_prior_data
+
+cfg = sample_full_distribution_config(
+    overrides={
+        "seq_len": 512,
+        "num_features": 20,
+        "num_causes": 20,
+        "seed": 123,
+    }
+)
+out = generate_simplified_prior_data(cfg, num_datasets=16)
+```
+
+This profile is intentionally broad-but-bounded:
+- includes all 3 generation modes (`head`, `causal`, `roots`) when feasible
+- includes both TTE mechanisms (`cox`, `aft`)
+- includes censoring diversity (`administrative`, `log_location`)
+- tightens extreme tails compared with permissive defaults
+
+Stage-dependent factor sampling in `sample_full_distribution_config`:
+- generation mode:
+  - values: `(\"head\", \"causal\", \"roots\")`
+  - probs: `(0.45, 0.35, 0.20)`
+  - if `num_causes != num_features`, `roots` is removed and probs are renormalized
+- num layers:
+  - values: `(3, 4, 5)`
+  - probs: `(0.40, 0.40, 0.20)`
+- hidden dim:
+  - values: `(24, 32, 48)`
+  - probs: `(0.35, 0.45, 0.20)`
+
+Key bounded settings in `full_distribution_base_overrides()`:
+- latent signal bounds:
+  - `standardize_y=True`, `y_clip_value=8.0`
+- Cox:
+  - `cox_tier_probabilities=(0.45, 0.30, 0.20, 0.05)`
+  - `cox_weibull_theta_max=0.6`
+  - `cox_gompertz_hr_max=2.0`
+  - piecewise tightened:
+    - `min/max_intervals=3/6`
+    - `t_max=4.0`
+    - `b1/b2/b3 max = 0.7/0.5/0.3`
+- AFT:
+  - `aft_tier_probabilities=(0.45, 0.30, 0.20, 0.05)`
+  - `sigma in [0.7, 1.4]`
+  - `student_df in [5, 18]`
+  - `gg_k, gg_p in [0.8, 1.5]`
+  - `gev_xi_max=0.2`, `skew_alpha_max=4.0`
+- Censoring:
+  - `p_administrative_censoring=0.7`
+  - admin target censoring rate in `[0.15, 0.45]`
+  - log-location shift in `[-0.5, 0.5]`
+  - guardrails enabled with tighter multipliers:
+    - `censoring_clamp_min_multiplier=0.7`
+    - `censoring_clamp_max_multiplier=1.6`
+  - absolute time bounds:
+    - `censoring_time_min=1e-6`
+    - `censoring_time_max=1e6`
+
 ## 8) Validation checklist
 
 If you build downstream pipelines, verify these invariants:
