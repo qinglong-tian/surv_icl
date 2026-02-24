@@ -90,31 +90,165 @@ Note: `nu` exists in config for compatibility but is forced to `1.0` in `__post_
 
 ### 3.4) Step 4: Cox baseline sampling
 
-Cox tier and family are sampled from configured probabilities.
+Cox tier and family are sampled from configured probabilities, then inverse-transform sampling is applied.
 
-Supported families:
+Generic Cox sampling step:
+- sample `U ~ Uniform(0,1)`
+- compute `z = -log(U) / exp(eta)`
+- set `T = H0^{-1}(z)` where `H0` is cumulative baseline hazard
+
+`eta` is clipped to `[-20, 20]` before sampling, and resulting times are sanitized to positive finite bounds.
+
+#### 3.4.1) Cox tier-to-family structure
+
+- if `cox_tier=\"auto\"`, tier is sampled using `cox_tier_probabilities`
+- family candidates by tier:
+  - `tier1`: `exponential` (0.50), `weibull` (0.30), `gompertz` (0.20)
+  - `tier2`: `exponential` (0.15), `weibull` (0.35), `gompertz` (0.25), `piecewise` (0.25)
+  - `tier3`: `weibull` (0.20), `gompertz` (0.20), `piecewise` (0.60)
+  - `tier4`: `mixture` (1.00)
+
+#### 3.4.2) Cox family details
+
 - `exponential`
+  - baseline hazard: `h0(t)=1`
+  - cumulative hazard: `H0(t)=t`
+  - inverse: `T=z`
+  - parameters: none
+
 - `weibull`
+  - baseline hazard: `h0(t)=k t^{k-1}`
+  - cumulative hazard: `H0(t)=t^k`
+  - inverse: `T=z^(1/k)`
+  - shape parameter sampling:
+    - sample `u ~ Beta(a,a)`, `a = cox_weibull_shape_concentration`
+    - `theta = cox_weibull_theta_max * (2u-1)`
+    - `k = exp(theta)`
+    - therefore `k in [exp(-cox_weibull_theta_max), exp(cox_weibull_theta_max)]`
+
 - `gompertz`
+  - baseline hazard: `h0(t)=exp(alpha t)`
+  - cumulative hazard: `H0(t)=(exp(alpha t)-1)/alpha` (and `H0(t)=t` when `alpha≈0`)
+  - inverse:
+    - `T = log(1 + alpha z)/alpha` when numerically stable
+    - falls back to exponential-like behavior near `alpha=0`
+  - shape parameter sampling:
+    - `alpha_max = log(cox_gompertz_hr_max) / cox_gompertz_reference_time`
+    - sample `alpha` symmetrically in `[-alpha_max, alpha_max]` using concentration `cox_gompertz_shape_concentration`
+
 - `piecewise`
+  - baseline hazard: constant per interval
+    - `h0(t)=lambda_j` for `t_(j-1) < t <= t_j`
+  - interval count sampling:
+    - draw `n_intervals` in `[cox_piecewise_min_intervals, cox_piecewise_max_intervals]`
+    - tier-aware bias:
+      - `tier2`: lower half of interval range
+      - `tier3`: upper half of interval range
+  - breakpoint sampling:
+    - sample interval widths from Dirichlet with concentration `cox_piecewise_breakpoint_alpha`
+    - enforce minimum interval fraction `cox_piecewise_min_width_fraction`
+    - scale cumulative widths to `[0, cox_piecewise_t_max]`
+  - hazard-shape sampling:
+    - normalized interval midpoints `m` in `[0,1]`
+    - sample coefficients:
+      - `b1` in `[-cox_piecewise_b1_max, cox_piecewise_b1_max]`
+      - `b2` in `[-cox_piecewise_b2_max, cox_piecewise_b2_max]`
+      - `b3` in `[-cox_piecewise_b3_max, cox_piecewise_b3_max]`
+      - all via symmetric-beta concentration `cox_piecewise_shape_concentration`
+    - construct:
+      - `log(lambda)=b1*m + b2*(m^2 - 1/3) + b3*sin(2*pi*m)`
+      - `lambda = exp(log(lambda))`
+    - normalize hazards to weighted mean 1 across interval widths
+  - inverse:
+    - piecewise inversion over cumulative hazard segments plus tail segment
+
 - `mixture`
-
-Weibull shape sampling used in code:
-- sample `u ~ Beta(a, a)` where `a = cox_weibull_shape_concentration`
-- set `theta = cox_weibull_theta_max * (2u - 1)`
-- set `k = exp(theta)`
-
-So `k` lies in `[exp(-theta_max), exp(theta_max)]`.
+  - samples a finite mixture of Cox baselines (component-level heterogeneity)
+  - component count:
+    - `m ~ UniformInt[cox_mixture_min_components, cox_mixture_max_components]`
+  - weights:
+    - `w ~ Dirichlet(alpha)` with `alpha = cox_mixture_dirichlet_alpha`
+  - component family pool:
+    - from `cox_mixture_component_families` (allowed: `exponential`, `weibull`, `gompertz`)
+  - each component parameterized using same rules as non-mixture family samplers
+  - sampling:
+    - for each row, choose component index from categorical `w`
+    - apply that component's inverse transform
 
 ### 3.5) Step 5: AFT family sampling
 
-Supported families:
-- `normal`, `logistic`, `gumbel`
-- `student_t`, `generalized_gamma`, `gev`
-- `skew_normal`
-- `mixture`
+AFT uses:
+- `log(T) = eta + eps`
+- `T = exp(log(T))`
 
-AFT sampler draws family-specific parameters from bounded priors controlled by config.
+`eta` is clipped to `[-20,20]` before noise is added, then output times are sanitized to positive finite bounds.
+
+#### 3.5.1) AFT tier-to-family structure
+
+- if `aft_tier=\"auto\"`, tier is sampled using `aft_tier_probabilities`
+- family candidates by tier:
+  - `tier1`: `normal` (0.40), `logistic` (0.30), `gumbel` (0.30)
+  - `tier2`: `student_t` (0.40), `generalized_gamma` (0.35), `gev` (0.25)
+  - `tier3`: `skew_normal` (0.40), `student_t` (0.25), `generalized_gamma` (0.20), `gev` (0.15)
+  - `tier4`: `mixture` (1.00)
+
+#### 3.5.2) AFT family details
+
+- `normal`
+  - `eps ~ Normal(0, sigma)`
+  - `sigma` sampled in `[aft_sigma_min, aft_sigma_max]`
+
+- `logistic`
+  - `eps ~ Logistic(0, sigma)`
+  - `sigma` sampled in `[aft_sigma_min, aft_sigma_max]`
+
+- `gumbel`
+  - `eps ~ Gumbel(0, sigma)`
+  - `sigma` sampled in `[aft_sigma_min, aft_sigma_max]`
+
+- `student_t`
+  - `eps = sigma * t_df`
+  - `sigma` sampled in `[aft_sigma_min, aft_sigma_max]`
+  - `df` sampled in `[aft_student_df_min, aft_student_df_max]`
+
+- `generalized_gamma`
+  - sample `G ~ Gamma(k, 1)`
+  - set `eps = log(G)/p`
+  - `k` sampled in `[aft_gg_k_min, aft_gg_k_max]`
+  - `p` sampled in `[aft_gg_p_min, aft_gg_p_max]`
+
+- `gev`
+  - sample `U ~ Uniform(0,1)`
+  - if `xi≈0`: `eps = -log(-log(U))`
+  - else: `eps = ((-log(U))^(-xi)-1)/xi`
+  - `xi` sampled symmetrically in `[-aft_gev_xi_max, aft_gev_xi_max]`
+
+- `skew_normal`
+  - with skew parameter `alpha`:
+    - `delta = alpha/sqrt(1+alpha^2)`
+    - `z0,z1 ~ Normal(0,1)`
+    - `raw = delta*|z0| + sqrt(1-delta^2)*z1`
+    - centered to zero mean, then scaled by `sigma`
+  - `sigma` sampled in `[aft_sigma_min, aft_sigma_max]`
+  - `alpha` sampled symmetrically in `[-aft_skew_alpha_max, aft_skew_alpha_max]`
+
+- `mixture`
+  - component count:
+    - `m ~ UniformInt[aft_mixture_min_components, aft_mixture_max_components]`
+  - weights:
+    - `w ~ Dirichlet(alpha)` with `alpha = aft_mixture_dirichlet_alpha`
+  - component family pool:
+    - from `aft_mixture_component_families`
+    - allowed default set: `normal`, `logistic`, `gumbel`, `student_t`, `skew_normal`
+  - component parameters sampled by the same family-specific rules
+  - for each row, a component is chosen from categorical `w` and its `eps` sampler is applied
+
+#### 3.5.3) Shared parameter sampling helper
+
+For bounded parameters (`sigma`, `df`, `k`, `p`, shifts/rates, etc.), code uses beta-range sampling:
+- sample `u ~ Beta(a,a)`
+- map to interval `[L, U]` via `L + (U-L)*u`
+- concentration `a` controls centrality vs edge mass (higher `a` -> more centered).
 
 ### 3.6) Step 6: right censoring sampling
 
